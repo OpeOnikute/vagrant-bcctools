@@ -64,6 +64,11 @@ sudo execsnoop-bpfcc
 sudo /usr/sbin/execsnoop-bpfcc
 ```
 
+### Running custom BCC tools
+The custom tools are in `./bcc` and vagrant places the entire home directory in `/vagrant` on the box, so you can:
+- `vagrant ssh`
+- `sudo python /vagrant/bcc/<file-name>`
+
 ## copyright
 
 2019 &copy; Mark Sta Ana
