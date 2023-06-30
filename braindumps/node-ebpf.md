@@ -87,7 +87,7 @@ Misc
 - If I can't add a uprobe to Node, can I add a symbol to the underlying C libraries that are called? How can I see what C functions are being executed in Node? The perf out out should contain it?
     ```
     pgrep -n node
-    sudo perf record -F 99 -p 11285 -g
+    sudo perf record -F 99 -p `pgrep -n node` -g
     cat perf.data 
     sudo perf script > perfs.out
     cat ./perfs.out
@@ -130,7 +130,7 @@ Misc
 
     - Can you trace a node call by looking for the libuv equivalent of the call, and attaching a uprobe to it? e.g. uv_fs_write
         - Where are the lib uv functions defined?
-            - They are documented in `deps/uv/docs/src/fs.rst`
+            - They are documented in `deps/uv/docs/src/fs.rst` e.g. https://github.com/nodejs/node/blob/951da5282c7b00eb86a989336d628218fb2df057/deps/uv/docs/src/fs.rst#api 
             - Github also has a search thing. You can just search for the function in the Node repo? https://github.com/iovisor/bcc/search?q=bpf_usdt_readarg+path%3Aexamples&type=Code
         - How do you attach a uprobe?
             - You can attach one with BCC https://android.googlesource.com/platform/external/bcc/+/HEAD/docs/reference_guide.md#4_uprobes.
@@ -363,3 +363,134 @@ Misc
 - Propose to the Node JS team that we should write a bunch of articles about possibilities of kernel correlation with eBPF in Node, and volunteer to write them. After writing this article, link to it in the comment. (EXCITING TIMES)
 
 - Continue from here: the uv_fs_read function is not called, so I'll have to trace the fs.open call to see what libuv it actually uses, if at all.
+
+- You can attach a uprobe to the Node underlying function using bpftrace:
+
+    ```
+    /* Whenever any thread enters uv__run_timers, record the current time
+   in nanoseconds in a map. */
+    u:NODE_PATH:uv__run_timers { @[tid] = nsecs; }
+
+    /* Whenever any thread returns from uv__run_check, clear its time from
+    the map. */
+    ur:NODE_PATH:uv__run_check /@[tid]/ { delete(@[tid]); }
+
+    /* 99 times a second, check if any running thread has been blocked
+    for longer than 10 seconds. If so, take a core dump and stop
+    this script. */
+    p:hz:99 /@[tid]/ {
+        if (nsecs - @[tid] > 10000000000) {
+            system("gcore %d", pid);
+            exit();
+        }
+    }
+    ```
+
+    This means that the main issue here is finding the underlying libuv call for a node native function? Instead of reading the code, can we trace with perf and execute the function? That's a more sustainable approach.
+
+- I can find the libuv function definitions, and what they relate to in Node?
+
+- I can find the expected args to uv_read by searching in libuv?
+    - Search on Github and look at the function definitions on the right for clues: https://github.com/search?q=repo%3Alibuv%2Flibuv%20uv__read&type=code
+    - This is the definition: https://github.com/libuv/libuv/blob/7b43d70be4fe9c3f9003b189e62e4f86a6a88516/src/unix/stream.c#L1020
+    - Well it expects a stream as a struct entry, so if we look at the definition of a stream, we can find a property to print
+    - Maybe the flags field? https://github.com/libuv/libuv/blob/7b43d70be4fe9c3f9003b189e62e4f86a6a88516/include/uv.h#L474? Or data? 
+
+- I might as well inspect uv_read with bpftrace at this point, to see what I can find in the args? (Step 2)
+
+```
+vagrant@bullseye:~$ sudo bpftrace -e 'u:/var/src/node/out/Release/node:uv__read { printf("arg0: %d\n", arg0) }'
+Attaching 1 probe...
+arg0: 432303552
+arg0: 432303552
+arg0: 432303552
+
+vagrant@bullseye:~$ sudo bpftrace -e 'uretprobe:/var/src/node/out/Release/node:uv__read { printf("uv__read: \"%d\"\n", retval); }'
+Attaching 1 probe...
+uv__read: "431076576"
+uv__read: "431076576"
+```
+
+- So I can trace file opens and print the stack trace, but how do I access the arguments of the function itself? I'm getting only numbers as the args. I suspect it's a lack of understanding of how the uprobe args work
+```
+vagrant@bullseye:~$ sudo bpftrace -e 'u:/var/src/node/out/Release/node:uv_fs_open { printf("process: %d %d %d %d %d %d\n", arg0, arg1, arg2, arg3, arg4, arg5) }'
+Attaching 1 probe...
+process: -2055237312 -2026691864 1492749352 0 438 -2087665872
+process: -2055237312 -2026691864 1492749352 0 438 -2087665872
+```
+    - This explains the arguments issue a bit. https://github.com/iovisor/bpftrace/issues/1343#issuecomment-631862951 Bpftrace takes the integer or pointer arguments? Does this mean we can use the pointer to access the value?
+        ```
+        The first six integer or pointer arguments are passed in registers RDI, RSI, RDX, RCX, R8, R9 [...], while XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6 and XMM7 are used for the first floating point arguments.
+        https://en.wikipedia.org/wiki/X86_calling_conventions#System_V_AMD64_ABI
+        ```
+
+- WELL I can access the function arguments by just reading the spec in the docs and printing out the arg that correspond to the input, in this case the 3rd argument (arg2):
+```
+vagrant@bullseye:~$ sudo bpftrace -e 'u:/var/src/node/out/Release/node:uv_fs_open { printf("process: %s, pid: %d, file path: %s\n", comm, pid, str(arg2)) }'
+Attaching 1 probe...
+process: node, pid: 336543, file path: /vagrant/src/text.txt
+process: node, pid: 336543, file path: /vagrant/src/text.txt
+```
+
+- Brendan's BPFTrace cheatsheet is great for seeing what is available e.g. the pid, comm etc https://www.brendangregg.com/BPF/bpftrace-cheat-sheet.html
+
+- Getting stack traces to work is not worth the effort. I have tried multiple things and no dice. Best thing to do is just talk about it and say it's possible with some luck, or make it a hypothetical and say it is useful if you have multiple Node processes running and want to tell which is responsible, or which thread is the cause.
+
+- List of common node functions and their documentation locations for triage:
+   ```
+   fs: https://github.com/nodejs/node/blob/951da5282c7b00eb86a989336d628218fb2df057/deps/uv/docs/src/fs.rst#api. See uv_fs_open, uv_fs_read, uv_fs_close etc.
+   dns: https://github.com/nodejs/node/blob/951da5282c7b00eb86a989336d628218fb2df057/deps/uv/docs/src/dns.rst#api. See uv_getaddrinfo, uv_getnameinfo etc.
+   ```
+
+- Reading through the docs, and I think you actually have to check what libuv functions are called by Node.
+
+- Steps:
+1. List the libuv functions in the Node binary. This is how you know what you can add a uprobe to. It's quite verbose so you can filter out unneeded functions using `egrep`. e.g to list the fs functions;
+```
+vagrant@bullseye:~$ objdump -tT /var/src/node/out/Release/node | grep uv_fs | egrep -v "(4node|ZN6)" | head -n10
+0000000001138910 l     F .text  0000000000000466              uv_fs_event_start.part.0
+00000000011295f0 g     F .text  0000000000000110              uv_fs_chmod
+000000000111e6a0 g     F .text  000000000000018e              uv_fs_poll_start
+000000000112a9a0 g     F .text  00000000000000c5              uv_fs_readdir
+0000000001139a80 g     F .text  00000000000000bd              uv_fs_event_stop
+000000000112ad00 g     F .text  000000000000013e              uv_fs_rename
+0000000001129ce0 g     F .text  00000000000000a7              uv_fs_fsync
+0000000001123f20 g     F .text  000000000000006e              uv_fs_event_getpath
+000000000112b800 g     F .text  0000000000000007              uv_fs_get_system_error
+000000000111e8f0 g     F .text  00000000000000ae              uv_fs_poll_getpath
+```
+2. Read the docs to see what the function argument are. You will need this when trying to print arguments like what path was called. To find a function, you can search the libuv docs. e.g. this search for [uv_fs_rename](https://github.com/search?q=repo%3Anodejs%2Fnode%20path%3Adeps%2Fuv%2Fdocs%20uv_fs_rename&type=code) shows that the 3rd argument is the file path, second is a req struct etc. If you're curious, you can search for the unfamiliar struct names using the same technique. Overall the file path seems the most useful for these FS calls.
+
+```
+.. c:function:: int uv_fs_rename(uv_loop_t* loop, uv_fs_t* req, const char* path, const char* new_path, uv_fs_cb cb)
+
+    Equivalent to :man:`rename(2)`.
+```
+
+3. Attach a uprobe using bpftrace to the libuv function, and you can trace any calls from Node to that function. [This bpftrace cheatsheet](https://www.brendangregg.com/BPF/bpftrace-cheat-sheet.html) is useful for checking what is available to expose. The example below prints out the Process name, PID, File Path and Stack Trace when the `uv_fs_open` function is called. The file path is the string value of `arg2` as the path is the 3rd argument. For more information about args, see [this section](https://github.com/iovisor/bpftrace/blob/master/docs/reference_guide.md#4-uprobeuretprobe-dynamic-tracing-user-level-arguments) of the bpftrace reference guide. 
+
+```
+# Run Node with debug symbols and a mock endpoint that opens a file
+vagrant@bullseye:~$ /var/src/node/out/Release/node --perf_basic_prof_only_functions /vagrant/src/app.js
+go to http://localhost:8080/ to generate traffic
+gotten file
+
+vagrant@bullseye:/vagrant$ sudo bpftrace -e 'u:/var/src/node/out/Release/node:uv_fs_open { printf("process: %s, pid: %d, file path: %s, stack: %s\n", comm, pid, str(arg2), ustack) }'
+
+process: node, pid: 349854, file path: /vagrant/src/text.txt, stack: 
+        uv_fs_open+0
+        [...]
+        uv__read+629
+        uv__stream_io+160
+        uv__io_poll+1372
+        uv_run+324
+        node::NodeMainInstance::Run()+620
+        node::Start(int, char**)+492
+        __libc_start_main+234
+        0x5541d68949564100
+```
+
+This is powerful because you can filter out by Node Process, Thread, Cgroups (for containerised environments) etc. You gain the ability to correlate what is happening on a machine with a Node process, without touching any code. The output is pretty verbose so I cut out the internal Node functions. In an ideal world, we'd see the full Node stack traces here all the time, but as mentioned above this is inconsistent because of the JIT-nature of Node. I get some express stacks once in a while, but not often enough to be useful.
+
+For HTTP requests, I did some digging and I'm not convinced that Node uses libuv entirely for those. There are some [TCP](https://github.com/nodejs/node/blob/951da5282c7b00eb86a989336d628218fb2df057/deps/uv/docs/src/tcp.rst), [DNS](https://github.com/nodejs/node/blob/951da5282c7b00eb86a989336d628218fb2df057/deps/uv/docs/src/dns.rst#api) functions, but it's hard to draw a straight line from the Node HTTP module to them. Someone with a better understanding of NodeJS internals would be better placed to investigate that.
+
