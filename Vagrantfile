@@ -2,7 +2,11 @@
 # vi: set ft=ruby :
 
 Vagrant.configure("2") do |config|
-  config.vm.box = "hashicorp/bionic64"
-  config.vm.box_version = "1.0.282"
+  config.vm.box = "debian/bullseye64"
   config.vm.provision :shell, :privileged => false, :path => "scripts/setup.sh"
+
+  config.vm.provider "virtualbox" do |v|
+    v.memory = 6144
+    v.cpus = 4
+  end
 end
